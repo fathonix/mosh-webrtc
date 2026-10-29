@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mosh over WebRTC</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-unicode11@0.6.0/lib/xterm-addon-unicode11.js"></script>
+    <script src="wasm_exec.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body, html {
+            height: 100%;
+            background-color: #1a1b26;
+            color: #c0caf5;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        #header {
+            padding: 10px 16px;
+            background: #16161e;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #292e42;
+        }
+        .title {
+            font-weight: 600;
+            font-size: 15px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .badge {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: #f7768e;
+        }
+        .badge.connecting { background-color: #e0af68; }
+        .badge.connected { background-color: #9ece6a; }
+        #terminal-container {
+            flex: 1;
+            padding: 8px;
+            position: relative;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        button {
+            background: #7aa2f7;
+            color: #15161e;
+            border: none;
+            padding: 6px 14px;
+            border-radius: 4px;
+            font-weight: 600;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        button:hover { background: #89b4fa; }
+        button:disabled { background: #414868; color: #787c99; cursor: not-allowed; }
+        button.secondary {
+            background: #24283b;
+            color: #c0caf5;
+            border: 1px solid #414868;
+        }
+        button.secondary:hover { background: #2f354d; }
+    </style>
+</head>
+<body>
+    <div id="header">
+        <div class="title">
+            <span id="status-badge" class="badge"></span>
+            <span id="status-text">Disconnected</span>
+        </div>
+        <div class="controls">
+            <button id="retry-btn" class="secondary" onclick="retryConnection()" style="display: none;">Retry / Redraw</button>
+            <button id="connect-btn" onclick="startMosh()">Connect</button>
+        </div>
+    </div>
+    <div id="terminal-container"></div>
+
+    <script>
+        const statusBadge = document.getElementById("status-badge");
+        const statusText = document.getElementById("status-text");
+        const connectBtn = document.getElementById("connect-btn");
+        const retryBtn = document.getElementById("retry-btn");
+
+        const term = new Terminal({
+            allowProposedApi: true,
+            cursorBlink: true,
+            fontSize: 14,
+            fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+            theme: {
+                background: '#1a1b26',
+                foreground: '#c0caf5',
+                cursor: '#c0caf5',
+                selectionBackground: '#33467c'
+            }
+        });
+        const fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        const unicode11Addon = new Unicode11Addon.Unicode11Addon();
+        term.loadAddon(unicode11Addon);
+        term.unicode.activeVersion = '11';
+        term.open(document.getElementById('terminal-container'));
+        fitAddon.fit();
+
+        let lastCols = term.cols;
+        let lastRows = term.rows;
+        let resizeDebounce = null;
+
+        function handleResize() {
+            fitAddon.fit();
+            if (term.cols === lastCols && term.rows === lastRows) return;
+            lastCols = term.cols;
+            lastRows = term.rows;
+
+            if (resizeDebounce) clearTimeout(resizeDebounce);
+            resizeDebounce = setTimeout(() => {
+                if (moshSession) {
+                    moshSession.resize(term.cols, term.rows);
+                    moshSession.tick();
+                }
+            }, 60);
+        }
+        window.addEventListener('resize', handleResize);
+        new ResizeObserver(handleResize).observe(document.getElementById('terminal-container'));
+
+        let wasmLoaded = false;
+        async function loadWasm() {
+            if (wasmLoaded) return;
+            statusText.textContent = "Loading Mosh WASM...";
+            const go = new Go();
+            const result = await WebAssembly.instantiateStreaming(fetch("mosh.wasm"), go.importObject);
+            go.run(result.instance);
+            wasmLoaded = true;
+        }
+
+        function filterPrivateCandidates(sdp) {
+            if (!sdp) return sdp;
+            return sdp.split("\r\n").filter(line => {
+                if (!line.startsWith("a=candidate")) return true;
+                if (line.includes("typ host") || line.includes(".local")) return false;
+                const parts = line.trim().split(/\s+/);
+                if (parts.length >= 5) {
+                    const addr = parts[4];
+                    if (addr.endsWith(".local") || /^(10\.|192\.168\.|127\.|169\.254\.|0\.0\.0\.0|fe80:|fc00:|fd00:|::1)/i.test(addr)) return false;
+                    if (addr.startsWith("172.")) {
+                        const sub = parseInt(addr.split(".")[1], 10);
+                        if (sub >= 16 && sub <= 31) return false;
+                    }
+                }
+                return true;
+            }).join("\r\n");
+        }
+
+        let moshSession = null;
+        let pollTimer = null;
+        let activePC = null;
+        let currentSessionId = null;
+        let isReconnecting = false;
+        let termInputHooked = false;
+
+        async function createAndOffer(pc, sessionId = null) {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            await new Promise(resolve => {
+                if (pc.iceGatheringState === "complete") {
+                    resolve();
+                } else {
+                    const checkState = () => {
+                        if (pc.iceGatheringState === "complete") {
+                            pc.removeEventListener("icegatheringstatechange", checkState);
+                            resolve();
+                        }
+                    };
+                    pc.addEventListener("icegatheringstatechange", checkState);
+                    setTimeout(resolve, 400);
+                }
+            });
+
+            const cleanOfferSDP = filterPrivateCandidates(pc.localDescription.sdp);
+            const res = await fetch("/api/offer", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ sdp: cleanOfferSDP, sessionId: sessionId })
+            });
+
+            if (!res.ok) {
+                throw new Error(await res.text());
+            }
+
+            const data = await res.json();
+            const filteredAnswer = filterPrivateCandidates(data.sdp);
+            await pc.setRemoteDescription({ type: "answer", sdp: filteredAnswer });
+            return data;
+        }
+
+        async function triggerReconnect(reason = "Network switch") {
+            if (!currentSessionId || !moshSession || isReconnecting) return;
+            isReconnecting = true;
+            statusBadge.className = "badge connecting";
+            statusText.textContent = `Roaming/Reconnecting (${reason})...`;
+
+            try {
+                if (activePC) {
+                    try { activePC.close(); } catch (_) {}
+                    activePC = null;
+                }
+
+                const configResp = await fetch("/api/config");
+                const config = await configResp.json();
+
+                const newPC = new RTCPeerConnection({ iceServers: config.iceServers });
+                activePC = newPC;
+
+                const newDC = newPC.createDataChannel("mosh", {
+                    ordered: false,
+                    maxRetransmits: 2
+                });
+                newDC.binaryType = "arraybuffer";
+                setupDataChannelHooks(newDC);
+
+                setupPeerConnectionHooks(newPC);
+
+                const data = await createAndOffer(newPC, currentSessionId);
+
+                if (data.sessionId && data.sessionId !== currentSessionId) {
+                    handleSessionTerminated("Session expired");
+                    return;
+                }
+
+                await new Promise((resolve, reject) => {
+                    const timer = setTimeout(() => reject(new Error("Reconnect DataChannel timeout")), 12000);
+                    newDC.onopen = () => {
+                        clearTimeout(timer);
+                        resolve();
+                    };
+                    newDC.onerror = (e) => reject(e);
+                });
+
+                // Hot-swap the WebRTC DataChannel inside the running mosh-go client!
+                moshSession.swapDataChannel(newDC);
+                isReconnecting = false;
+                statusBadge.className = "badge connected";
+                statusText.textContent = "Connected (Roamed)";
+                retryBtn.style.display = "inline-block";
+                moshSession.tick();
+                // Redraw latest state to guarantee screen is refreshed after reconnection
+                const redraw = moshSession.redraw();
+                if (redraw) term.write(redraw);
+            } catch (err) {
+                console.warn("[Reconnect error]", err);
+                isReconnecting = false;
+                statusBadge.className = "badge";
+                statusText.textContent = "Roaming failed: " + err.message;
+                retryBtn.style.display = "inline-block";
+            }
+        }
+
+        function setupDataChannelHooks(dc) {
+            dc.onclose = () => {
+                console.log("[DataChannel] Closed");
+                if (isReconnecting) return;
+                handleSessionTerminated("Shell session ended");
+            };
+        }
+
+        function handleSessionTerminated(msg) {
+            currentSessionId = null;
+            moshSession = null;
+            if (activePC) {
+                try { activePC.close(); } catch (_) {}
+                activePC = null;
+            }
+            if (pollTimer) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+            }
+            statusBadge.className = "badge";
+            statusText.textContent = `${msg}. Click Connect to start a new session.`;
+            connectBtn.disabled = false;
+            retryBtn.style.display = "none";
+        }
+
+        function setupPeerConnectionHooks(pc) {
+            pc.oniceconnectionstatechange = () => {
+                const state = pc.iceConnectionState;
+                console.log("[ICE State]", state);
+                if (state === "disconnected" || state === "failed") {
+                    // Network changed, Wi-Fi dropped, or roaming
+                    triggerReconnect(state);
+                }
+            };
+        }
+
+        // Automatic reconnection on online event (e.g., reconnecting to Wi-Fi/cellular)
+        window.addEventListener("online", () => {
+            console.log("[Network] Online event received");
+            triggerReconnect("Online");
+        });
+
+        async function startMosh() {
+            connectBtn.disabled = true;
+            statusBadge.className = "badge connecting";
+            statusText.textContent = "Initializing...";
+
+            try {
+                await loadWasm();
+
+                const configResp = await fetch("/api/config");
+                const config = await configResp.json();
+
+                if (activePC) {
+                    try { activePC.close(); } catch (_) {}
+                }
+
+                const pc = new RTCPeerConnection({ iceServers: config.iceServers });
+                activePC = pc;
+                setupPeerConnectionHooks(pc);
+
+                const dc = pc.createDataChannel("mosh", {
+                    ordered: false,
+                    maxRetransmits: 2
+                });
+                dc.binaryType = "arraybuffer";
+                setupDataChannelHooks(dc);
+
+                statusText.textContent = "Connecting to mosh-server...";
+                const data = await createAndOffer(pc, null);
+                currentSessionId = data.sessionId;
+
+                statusText.textContent = "Awaiting WebRTC DataChannel...";
+                await new Promise((resolve, reject) => {
+                    const timer = setTimeout(() => reject(new Error("DataChannel open timeout")), 15000);
+                    dc.onopen = () => {
+                        clearTimeout(timer);
+                        resolve();
+                    };
+                    dc.onerror = (e) => reject(e);
+                });
+
+                statusBadge.className = "badge connected";
+                statusText.textContent = `Connected (mosh UDP ${data.port})`;
+                retryBtn.style.display = "inline-block";
+
+                fitAddon.fit();
+                moshSession = await moshConnectRTC(dc, data.key, term.cols, term.rows);
+                moshSession.resize(term.cols, term.rows);
+                moshSession.send("\r");
+                moshSession.tick();
+                term.focus();
+
+                if (!termInputHooked) {
+                    termInputHooked = true;
+                    term.onData(chars => {
+                        if (moshSession) {
+                            moshSession.send(chars);
+                        }
+                    });
+
+                    term.onBinary(data => {
+                        if (moshSession) {
+                            moshSession.send(data);
+                        }
+                    });
+                }
+
+                if (pollTimer) clearInterval(pollTimer);
+                pollTimer = setInterval(() => {
+                    if (moshSession) {
+                        moshSession.tick();
+                        const output = moshSession.poll();
+                        if (output) {
+                            term.write(output);
+                        }
+                    }
+                }, 16);
+
+                dc.onclose = () => {
+                    if (!isReconnecting) {
+                        statusBadge.className = "badge";
+                        statusText.textContent = "Disconnected";
+                        connectBtn.disabled = false;
+                        retryBtn.style.display = "inline-block";
+                    }
+                };
+
+            } catch (err) {
+                console.error(err);
+                statusBadge.className = "badge";
+                statusText.textContent = "Error: " + err.message;
+                connectBtn.disabled = false;
+                retryBtn.style.display = "inline-block";
+                term.writeln("\r\n[Connection Error: " + err.message + "]");
+            }
+        }
+
+        async function retryConnection() {
+            if (retryBtn.disabled) return;
+            retryBtn.disabled = true;
+
+            try {
+                if (currentSessionId && moshSession) {
+                    // If session is alive, redraw screen and kick WebRTC reconnect
+                    const redraw = moshSession.redraw();
+                    if (redraw) term.write(redraw);
+                    await triggerReconnect("User Retry");
+                } else {
+                    await startMosh();
+                }
+            } finally {
+                // Cooldown: re-enable after 1.5s to prevent hammering TURN/signaling
+                setTimeout(() => {
+                    retryBtn.disabled = false;
+                }, 1500);
+            }
+        }
+    </script>
+</body>
+</html>
