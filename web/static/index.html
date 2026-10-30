@@ -356,7 +356,6 @@
                 fitAddon.fit();
                 moshSession = await moshConnectRTC(dc, data.key, term.cols, term.rows);
                 moshSession.resize(term.cols, term.rows);
-                moshSession.send("\r");
                 moshSession.tick();
                 term.focus();
 

@@ -115,7 +115,8 @@ func fetchCloudflareICEServers() ([]webrtc.ICEServer, error) {
 }
 
 func startMoshServer() (int, string, *exec.Cmd, error) {
-	cmd := exec.Command("mosh-server", "new", "-p", "0", "-c", "256")
+	// login (setuid root) asks for username + password; -p keeps our LANG/TERM env
+	cmd := exec.Command("mosh-server", "new", "-p", "0", "-c", "256", "--", "/usr/bin/login", "-p")
 	cmd.Env = append(os.Environ(),
 		"LANG=en_US.UTF-8",
 		"LC_ALL=en_US.UTF-8",
@@ -428,7 +429,9 @@ func startReaper() {
 }
 
 func main() {
+	host := getEnv("HOST", "127.0.0.1")
 	port := getEnv("PORT", "8090")
+	addr := net.JoinHostPort(host, port)
 	fs := http.FileServer(http.Dir("web/static"))
 
 	startReaper()
@@ -437,8 +440,8 @@ func main() {
 	http.HandleFunc("/api/config", handleConfig)
 	http.HandleFunc("/api/offer", handleOffer)
 
-	log.Printf("[INFO] Mosh WebRTC server listening on http://0.0.0.0:%s", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	log.Printf("[INFO] Mosh WebRTC server listening on http://%s", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatalf("Server exited: %v", err)
 	}
 }
