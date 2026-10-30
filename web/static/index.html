@@ -170,6 +170,7 @@
         let moshSession = null;
         let pollTimer = null;
         let activePC = null;
+        let activeDC = null;
         let currentSessionId = null;
         let isReconnecting = false;
         let termInputHooked = false;
@@ -255,6 +256,7 @@
 
                 // Hot-swap the WebRTC DataChannel inside the running mosh-go client!
                 moshSession.swapDataChannel(newDC);
+                activeDC = newDC;
                 isReconnecting = false;
                 statusBadge.className = "badge connected";
                 statusText.textContent = "Connected (Roamed)";
@@ -284,7 +286,8 @@
         function setupDataChannelHooks(dc) {
             dc.onclose = async () => {
                 console.log("[DataChannel] Closed");
-                if (isReconnecting) return;
+                // Ignore channels superseded by a roam or closed by us.
+                if (isReconnecting || (activeDC && dc !== activeDC)) return;
                 // The server drops the session when login/shell exits; a network
                 // drop leaves it alive for roaming. Only the former is terminal.
                 if (currentSessionId && !(await sessionAlive(currentSessionId))) {
@@ -301,6 +304,7 @@
         function handleSessionTerminated(msg) {
             currentSessionId = null;
             moshSession = null;
+            activeDC = null;
             if (activePC) {
                 try { activePC.close(); } catch (_) {}
                 activePC = null;
@@ -317,6 +321,7 @@
 
         function setupPeerConnectionHooks(pc) {
             pc.oniceconnectionstatechange = () => {
+                if (pc !== activePC) return; // stale connection from an earlier attempt
                 const state = pc.iceConnectionState;
                 console.log("[ICE State]", state);
                 if (state === "disconnected" || state === "failed") {
@@ -356,6 +361,7 @@
                     maxRetransmits: 2
                 });
                 dc.binaryType = "arraybuffer";
+                activeDC = dc;
                 setupDataChannelHooks(dc);
 
                 statusText.textContent = "Connecting to mosh-server...";

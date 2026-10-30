@@ -7,6 +7,7 @@ set +a
 # Ensure homebrew binaries (like mosh-server) and standard paths are in PATH
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 export PORT=${PORT:-8090}
+export MODE=${MODE:-development}
 
 cd "$DIR"
 exec "$DIR/mosh-webrtc-server"

@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -34,7 +36,41 @@ type Session struct {
 var (
 	sessionsMu sync.Mutex
 	sessions   = make(map[string]*Session)
+
+	// TURN credentials are valid for 24h; cache them so every connect does not
+	// cost a Cloudflare API round trip (and quota).
+	iceMu     sync.Mutex
+	iceCached []webrtc.ICEServer
+	iceExpiry time.Time
 )
+
+// newSessionID returns an unguessable session identifier: it is the only thing
+// needed to re-attach to a live shell, so it must not be predictable.
+func newSessionID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func cachedICEServers() ([]webrtc.ICEServer, error) {
+	iceMu.Lock()
+	defer iceMu.Unlock()
+
+	if len(iceCached) > 0 && time.Now().Before(iceExpiry) {
+		return iceCached, nil
+	}
+	servers, err := fetchCloudflareICEServers()
+	if err != nil {
+		if len(iceCached) > 0 {
+			return iceCached, nil // keep serving the last known good set
+		}
+		return nil, err
+	}
+	iceCached, iceExpiry = servers, time.Now().Add(time.Hour)
+	return servers, nil
+}
 
 func getEnv(key, fallback string) string {
 	if val := os.Getenv(key); val != "" {
@@ -156,7 +192,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	iceServers, err := fetchCloudflareICEServers()
+	iceServers, err := cachedICEServers()
 	if err != nil {
 		log.Printf("[WARN] Error getting ICE servers: %v", err)
 	}
@@ -192,7 +228,12 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		sessionID := fmt.Sprintf("s-%d", time.Now().UnixNano())
+		sessionID, err := newSessionID()
+		if err != nil {
+			peerConnection.Close()
+			http.Error(w, "Failed to generate session id", http.StatusInternalServerError)
+			return
+		}
 		sess = &Session{
 			ID:        sessionID,
 			Key:       moshSrv.KeyBase64(),
@@ -246,6 +287,10 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		sess.PeerConn = peerConnection
 		sess.LastSeen = time.Now()
 		sess.mu.Unlock()
+
+		// Full repaint over the new channel: the client may have missed diffs
+		// while the old transport was dead.
+		sess.Server.TriggerResync()
 	}
 
 	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -326,7 +371,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleConfig(w http.ResponseWriter, r *http.Request) {
-	iceServers, err := fetchCloudflareICEServers()
+	iceServers, err := cachedICEServers()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -411,13 +456,20 @@ func main() {
 
 	startReaper()
 
-	http.Handle("/", fs)
-	http.HandleFunc("/api/config", handleConfig)
-	http.HandleFunc("/api/offer", handleOffer)
-	http.HandleFunc("/api/session/", handleSession)
+	mux := http.NewServeMux()
+	mux.Handle("/", fs)
+	mux.HandleFunc("/api/config", handleConfig)
+	mux.HandleFunc("/api/offer", handleOffer)
+	mux.HandleFunc("/api/session/", handleSession)
+
+	if production() {
+		log.Println("[INFO] MODE=production: Cloudflare Access JWT required")
+	} else {
+		log.Println("[INFO] MODE=development: authentication disabled")
+	}
 
 	log.Printf("[INFO] Mosh WebRTC server listening on http://%s", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	if err := http.ListenAndServe(addr, withAuth(mux)); err != nil {
 		log.Fatalf("Server exited: %v", err)
 	}
 }

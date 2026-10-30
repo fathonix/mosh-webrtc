@@ -3,6 +3,7 @@
 package mosh
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
@@ -17,8 +18,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/unixshells/vt-go"
 	"github.com/creack/pty"
+	"github.com/unixshells/vt-go"
 )
 
 var (
@@ -76,6 +77,14 @@ type Server struct {
 	// Optional in-memory datagram path (see AttachDatagrams); nil means UDP.
 	inbound <-chan []byte
 	sendOut func([]byte)
+
+	// resync asks the main loop to resend the whole screen (after a reconnect).
+	resync chan struct{}
+
+	// Login throttle: count failed login prompts seen on the PTY so a session
+	// cannot be used to brute-force the host account over the network.
+	authFailures int
+	scanTail     []byte
 
 	started chan struct{} // closed when PTY is running
 	done    chan struct{}
@@ -139,6 +148,7 @@ func newServer(shell string) (*Server, error) {
 		transport: NewTransport(ocb, true),
 		started:   make(chan struct{}),
 		done:      make(chan struct{}),
+		resync:    make(chan struct{}, 1),
 	}, nil
 }
 
@@ -243,6 +253,16 @@ func (s *Server) Serve() error {
 	return err
 }
 
+// TriggerResync forces the next diff to be against an empty screen (oldNum=0),
+// replaying the entire current terminal content to the client. Call this when
+// a client reconnects or roams to a new DataChannel.
+func (s *Server) TriggerResync() {
+	select {
+	case s.resync <- struct{}{}:
+	default:
+	}
+}
+
 // Done returns a channel that is closed when the server shuts down.
 func (s *Server) Done() <-chan struct{} {
 	return s.done
@@ -280,6 +300,28 @@ func (s *Server) withModes(diff []byte) []byte {
 	out := make([]byte, 0, len(s.pendingModes)+len(diff))
 	out = append(out, s.pendingModes...)
 	return append(out, diff...)
+}
+
+// maxLoginFailures is how many "Login incorrect" replies a single session may
+// produce before its shell is killed.
+const maxLoginFailures = 5
+
+// countAuthFailures reports true once the session has produced too many failed
+// logins. The tail is kept so a message split across two PTY reads still matches.
+func (s *Server) countAuthFailures(data []byte) bool {
+	s.scanTail = append(s.scanTail, data...)
+	for {
+		i := bytes.Index(s.scanTail, []byte("Login incorrect"))
+		if i < 0 {
+			break
+		}
+		s.scanTail = s.scanTail[i+len("Login incorrect"):]
+		s.authFailures++
+	}
+	if len(s.scanTail) > 32 {
+		s.scanTail = s.scanTail[len(s.scanTail)-32:]
+	}
+	return s.authFailures >= maxLoginFailures
 }
 
 // captureModes records mouse-tracking mode changes from raw PTY output.
@@ -395,6 +437,9 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 				return
 			}
 			s.captureModes(data)
+			if s.countAuthFailures(data) && s.cmd != nil && s.cmd.Process != nil {
+				s.cmd.Process.Kill()
+			}
 			s.emu.Write(data)
 			dirty = true
 
@@ -416,6 +461,15 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 				s.transport.ResetDiffBase()
 				dirty = true
 			}
+
+		case <-s.resync:
+			s.mu.Lock()
+			cols, rows := s.cols, s.rows
+			s.mu.Unlock()
+			s.baseFB = NewFramebuffer(cols, rows)
+			s.sentFB = nil
+			s.transport.ResetDiffBase()
+			dirty = true
 
 		case <-ticker.C:
 			if s.sentFB != nil && s.transport.AckedByRemote() >= s.transport.SentNum() {
@@ -503,6 +557,9 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 				return
 			}
 			s.captureModes(data)
+			if s.countAuthFailures(data) && s.cmd != nil && s.cmd.Process != nil {
+				s.cmd.Process.Kill()
+			}
 			s.emu.Write(data)
 			dirty = true
 
@@ -525,6 +582,15 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 				s.transport.ResetDiffBase()
 				dirty = true
 			}
+
+		case <-s.resync:
+			s.mu.Lock()
+			cols, rows := s.cols, s.rows
+			s.mu.Unlock()
+			s.baseFB = NewFramebuffer(cols, rows)
+			s.sentFB = nil
+			s.transport.ResetDiffBase()
+			dirty = true
 
 		case <-ticker.C:
 			// Advance base when client acks all pending.
