@@ -19,7 +19,7 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /mosh-webrtc-server main.go
 # Runtime stage
 FROM alpine:latest
 
-RUN apk add --no-cache mosh-server bash ca-certificates tzdata
+RUN apk add --no-cache bash ca-certificates tzdata
 
 WORKDIR /app
 COPY --from=builder /mosh-webrtc-server /app/mosh-webrtc-server

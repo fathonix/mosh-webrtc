@@ -502,7 +502,7 @@
                 activeDC = dc;
                 setupDataChannelHooks(dc);
 
-                statusText.textContent = "Connecting to mosh-server...";
+                statusText.textContent = "Connecting to gateway...";
                 const data = await createAndOffer(pc, null);
                 currentSessionId = data.sessionId;
 

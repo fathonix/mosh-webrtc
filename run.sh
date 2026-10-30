@@ -4,7 +4,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$DIR/../.env" ] && source "$DIR/../.env"
 set +a
 
-# Ensure homebrew binaries (like mosh-server) and standard paths are in PATH
+# Ensure homebrew binaries and standard paths are in PATH
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 export PORT=${PORT:-8090}
 export APP_ENV=${APP_ENV:-development}

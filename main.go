@@ -312,7 +312,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		moshSrv, inbound, outbound, err := startMoshServer()
 		if err != nil {
 			peerConnection.Close()
-			http.Error(w, "Failed to start mosh-server: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Failed to start mosh server: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 

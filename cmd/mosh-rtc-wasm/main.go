@@ -202,7 +202,7 @@ func newRTCSession(dc js.Value, key string, cols, rows int) (*rtcSession, error)
 		return nil, err
 	}
 
-	// Tell mosh-server our initial dimensions immediately
+	// Tell the server our initial dimensions immediately
 	if cols > 0 && rows > 0 {
 		client.Resize(uint16(cols), uint16(rows))
 		client.Tick()
