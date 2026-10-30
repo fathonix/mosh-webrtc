@@ -45,7 +45,9 @@
         .badge.connecting { background-color: #e0af68; }
         .badge.connected { background-color: #9ece6a; }
         #terminal-container {
-            flex: 1;
+            flex: 1 1 0;
+            min-height: 0;
+            overflow: hidden;
             padding: 8px;
             position: relative;
         }
@@ -110,7 +112,10 @@
         const unicode11Addon = new Unicode11Addon.Unicode11Addon();
         term.loadAddon(unicode11Addon);
         term.unicode.activeVersion = '11';
-        term.open(document.getElementById('terminal-container'));
+        const termContainer = document.getElementById('terminal-container');
+        term.open(termContainer);
+        // Right click is a terminal mouse report, not a browser menu.
+        termContainer.addEventListener('contextmenu', e => e.preventDefault());
         fitAddon.fit();
 
         let lastCols = term.cols;
@@ -267,11 +272,29 @@
             }
         }
 
+        async function sessionAlive(id) {
+            try {
+                const res = await fetch("/api/session/" + encodeURIComponent(id));
+                return res.status !== 404;
+            } catch (_) {
+                return true; // network error: assume the session is still there
+            }
+        }
+
         function setupDataChannelHooks(dc) {
-            dc.onclose = () => {
+            dc.onclose = async () => {
                 console.log("[DataChannel] Closed");
                 if (isReconnecting) return;
-                handleSessionTerminated("Shell session ended");
+                // The server drops the session when login/shell exits; a network
+                // drop leaves it alive for roaming. Only the former is terminal.
+                if (currentSessionId && !(await sessionAlive(currentSessionId))) {
+                    handleSessionTerminated("Shell session ended");
+                    return;
+                }
+                statusBadge.className = "badge";
+                statusText.textContent = "Disconnected";
+                connectBtn.disabled = false;
+                retryBtn.style.display = "inline-block";
             };
         }
 
@@ -350,7 +373,7 @@
                 });
 
                 statusBadge.className = "badge connected";
-                statusText.textContent = `Connected (mosh UDP ${data.port})`;
+                statusText.textContent = `Connected (mosh over WebRTC)`;
                 retryBtn.style.display = "inline-block";
 
                 fitAddon.fit();
@@ -384,15 +407,6 @@
                         }
                     }
                 }, 16);
-
-                dc.onclose = () => {
-                    if (!isReconnecting) {
-                        statusBadge.className = "badge";
-                        statusText.textContent = "Disconnected";
-                        connectBtn.disabled = false;
-                        retryBtn.style.display = "inline-block";
-                    }
-                };
 
             } catch (err) {
                 console.error(err);

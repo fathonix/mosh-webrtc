@@ -3,31 +3,28 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/pion/webrtc/v4"
+	mosh "github.com/unixshells/mosh-go"
 )
 
 type Session struct {
 	ID             string
-	Port           int
 	Key            string
-	Cmd            *exec.Cmd
+	Server         *mosh.Server
+	Inbound        chan []byte // DataChannel -> mosh server
+	Outbound       chan []byte // mosh server -> DataChannel
 	PeerConn       *webrtc.PeerConnection
 	DataChannel    *webrtc.DataChannel
-	UDPConn        *net.UDPConn
 	CreatedAt      time.Time
 	LastSeen       time.Time
 	DisconnectedAt time.Time
@@ -114,53 +111,34 @@ func fetchCloudflareICEServers() ([]webrtc.ICEServer, error) {
 	return servers, nil
 }
 
-func startMoshServer() (int, string, *exec.Cmd, error) {
-	// login (setuid root) asks for username + password; -p keeps our LANG/TERM env
-	cmd := exec.Command("mosh-server", "new", "-p", "0", "-c", "256", "--", "/usr/bin/login", "-p")
-	cmd.Env = append(os.Environ(),
-		"LANG=en_US.UTF-8",
-		"LC_ALL=en_US.UTF-8",
-		"TERM=xterm-256color",
-	)
-
-	stdout, err := cmd.StdoutPipe()
+// startMoshServer starts an in-process mosh server that has no UDP socket:
+// SSP datagrams flow through channels and into the WebRTC DataChannel.
+func startMoshServer() (*mosh.Server, chan []byte, chan []byte, error) {
+	// login (setuid root) asks for username + password.
+	srv, err := mosh.NewServerIO(getEnv("MOSH_LOGIN", "/usr/bin/login"))
 	if err != nil {
-		return 0, "", nil, err
-	}
-	cmd.Stderr = cmd.Stdout
-
-	if err := cmd.Start(); err != nil {
-		return 0, "", nil, fmt.Errorf("failed to start mosh-server: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to create mosh server: %w", err)
 	}
 
-	re := regexp.MustCompile(`MOSH CONNECT (\d+) ([\w+/=]+)`)
-	buf := make([]byte, 2048)
-	lineBuf := ""
-	timeout := time.After(5 * time.Second)
-
-	for {
+	inbound := make(chan []byte, 64)
+	outbound := make(chan []byte, 64)
+	srv.AttachDatagrams(inbound, func(dg []byte) {
+		cp := make([]byte, len(dg))
+		copy(cp, dg)
 		select {
-		case <-timeout:
-			cmd.Process.Kill()
-			return 0, "", nil, fmt.Errorf("timeout waiting for MOSH CONNECT")
-		default:
-			n, err := stdout.Read(buf)
-			if n > 0 {
-				lineBuf += string(buf[:n])
-				matches := re.FindStringSubmatch(lineBuf)
-				if len(matches) == 3 {
-					port, _ := strconv.Atoi(matches[1])
-					key := matches[2]
-					log.Printf("[INFO] Spawned mosh-server on UDP port %d (PID %d)", port, cmd.Process.Pid)
-					return port, key, cmd, nil
-				}
-			}
-			if err != nil {
-				cmd.Process.Kill()
-				return 0, "", nil, fmt.Errorf("error reading mosh-server stdout: %w", err)
-			}
+		case outbound <- cp:
+		default: // drop rather than block; SSP resends
 		}
-	}
+	})
+
+	go func() {
+		if err := srv.Serve(); err != nil {
+			log.Printf("[INFO] mosh server exited: %v", err)
+		}
+	}()
+
+	log.Printf("[INFO] Started in-process mosh server (no UDP port)")
+	return srv, inbound, outbound, nil
 }
 
 func handleOffer(w http.ResponseWriter, r *http.Request) {
@@ -201,43 +179,27 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		if existing, ok := sessions[req.SessionID]; ok {
 			sess = existing
 			isReconnect = true
-			log.Printf("[INFO] Reconnecting client to existing session %s (port %d)", req.SessionID, sess.Port)
+			log.Printf("[INFO] Reconnecting client to existing session %s", req.SessionID)
 		}
 	}
 	sessionsMu.Unlock()
 
 	if !isReconnect {
-		port, key, moshCmd, err := startMoshServer()
+		moshSrv, inbound, outbound, err := startMoshServer()
 		if err != nil {
 			peerConnection.Close()
 			http.Error(w, "Failed to start mosh-server: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		serverUDPAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("127.0.0.1:%d", port))
-		if err != nil {
-			moshCmd.Process.Kill()
-			peerConnection.Close()
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		localUDP, err := net.DialUDP("udp4", nil, serverUDPAddr)
-		if err != nil {
-			moshCmd.Process.Kill()
-			peerConnection.Close()
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		sessionID := fmt.Sprintf("%d-%d", port, time.Now().UnixNano())
+		sessionID := fmt.Sprintf("s-%d", time.Now().UnixNano())
 		sess = &Session{
 			ID:        sessionID,
-			Port:      port,
-			Key:       key,
-			Cmd:       moshCmd,
+			Key:       moshSrv.KeyBase64(),
+			Server:    moshSrv,
+			Inbound:   inbound,
+			Outbound:  outbound,
 			PeerConn:  peerConnection,
-			UDPConn:   localUDP,
 			CreatedAt: time.Now(),
 			LastSeen:  time.Now(),
 		}
@@ -246,25 +208,33 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		sessions[sessionID] = sess
 		sessionsMu.Unlock()
 
-		// Server UDP reader goroutine (bridges mosh-server -> current PeerConnection DataChannel)
+		// Bridge mosh datagrams -> current DataChannel (survives reconnects).
 		go func(s *Session) {
-			buf := make([]byte, 4096)
 			for {
-				n, err := s.UDPConn.Read(buf)
-				if err != nil {
-					if !errors.Is(err, net.ErrClosed) && !isTimeout(err) {
-						endSession(s, "mosh-server exited")
-					}
+				select {
+				case <-s.Server.Done():
 					return
-				}
-				s.mu.Lock()
-				dc := s.DataChannel
-				s.mu.Unlock()
-
-				if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen && n > 0 {
-					dc.Send(buf[:n])
+				case dg, ok := <-s.Outbound:
+					if !ok {
+						return
+					}
+					s.mu.Lock()
+					dc := s.DataChannel
+					s.mu.Unlock()
+					if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
+						if err := dc.Send(dg); err != nil {
+							log.Printf("[WARN] DataChannel send failed: %v", err)
+						}
+					}
 				}
 			}
+		}(sess)
+
+		// login/shell exit ends the session: close the DataChannel so the
+		// client stops showing a live-looking terminal and can reconnect.
+		go func(s *Session) {
+			<-s.Server.Done()
+			endSession(s, "shell exited")
 		}(sess)
 
 	} else {
@@ -306,9 +276,11 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			if len(msg.Data) > 0 {
-				if _, err := sess.UDPConn.Write(msg.Data); err != nil {
-					go endSession(sess, "mosh-server exited")
-					return
+				cp := make([]byte, len(msg.Data))
+				copy(cp, msg.Data)
+				select {
+				case sess.Inbound <- cp:
+				default:
 				}
 				sess.mu.Lock()
 				sess.LastSeen = time.Now()
@@ -349,7 +321,6 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		"sdp":        localDesc.SDP,
 		"sessionId":  sess.ID,
 		"key":        sess.Key,
-		"port":       sess.Port,
 		"iceServers": iceServers,
 	})
 }
@@ -385,12 +356,7 @@ func endSession(s *Session, reason string) {
 	if pc != nil {
 		pc.Close()
 	}
-	s.UDPConn.Close()
-}
-
-func isTimeout(err error) bool {
-	var ne net.Error
-	return errors.As(err, &ne) && ne.Timeout()
+	_ = s.Server.Kill()
 }
 
 // Session reaper: prune disconnected sessions older than 1 hour or inactive > 24h
@@ -413,19 +379,28 @@ func startReaper() {
 				// Prune if disconnected for > 1 hour, or overall idle for > 24 hours
 				if (isDisconnected && disconnectedDuration > 1*time.Hour) || idle > 24*time.Hour {
 					log.Printf("[INFO] Reaping mosh session %s (disconnected: %v, idle: %v)", id, disconnectedDuration.Round(time.Second), idle.Round(time.Second))
-					sess.UDPConn.Close()
 					if sess.PeerConn != nil {
 						sess.PeerConn.Close()
 					}
-					if sess.Cmd != nil && sess.Cmd.Process != nil {
-						sess.Cmd.Process.Kill()
-					}
+					_ = sess.Server.Kill()
 					delete(sessions, id)
 				}
 			}
 			sessionsMu.Unlock()
 		}
 	}()
+}
+
+func handleSession(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/session/")
+	sessionsMu.Lock()
+	_, ok := sessions[id]
+	sessionsMu.Unlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func main() {
@@ -439,6 +414,7 @@ func main() {
 	http.Handle("/", fs)
 	http.HandleFunc("/api/config", handleConfig)
 	http.HandleFunc("/api/offer", handleOffer)
+	http.HandleFunc("/api/session/", handleSession)
 
 	log.Printf("[INFO] Mosh WebRTC server listening on http://%s", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {

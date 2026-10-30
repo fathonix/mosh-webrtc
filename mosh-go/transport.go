@@ -141,6 +141,18 @@ func (t *Transport) SetPending(diff []byte) {
 	t.mu.Unlock()
 }
 
+// ResetDiffBase forces the next diff to be a full repaint from state 0. Used
+// when the receiver cannot reproduce the previous base (resize cleared it).
+func (t *Transport) ResetDiffBase() {
+	t.mu.Lock()
+	t.ackedByRemote = 0
+	t.diffOldNum = 0
+	t.hasPendingBase = false
+	t.diffSent = false
+	t.pendingDiff = nil
+	t.mu.Unlock()
+}
+
 // Tick produces outgoing wire datagrams if it's time to send.
 // Returns nil if nothing to send.
 func (t *Transport) Tick() [][]byte {

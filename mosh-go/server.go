@@ -11,12 +11,22 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/unixshells/vt-go"
 	"github.com/creack/pty"
+)
+
+var (
+	decModeRe = regexp.MustCompile(`\x1b\[\?([0-9;]+)([hl])`)
+	// mouseModes are the DEC private modes xterm.js must see to capture pointer
+	// input. Everything else (alt screen 1049, cursor 25) would desync xterm
+	// from the shadow framebuffer we render into.
+	mouseModes = map[string]bool{"9": true, "1000": true, "1002": true, "1003": true, "1005": true, "1006": true, "1015": true, "1016": true}
 )
 
 const (
@@ -55,9 +65,17 @@ type Server struct {
 	sentFB     *Framebuffer // what we last sent (pending ack)
 	curVisible atomic.Bool
 
+	// pendingModes holds mouse-tracking mode changes seen on the PTY. The diff
+	// carries only rendered cells, so these must be replayed to the client.
+	pendingModes []byte
+
 	// Remote client address — set on first received datagram.
 	mu         sync.Mutex
 	clientAddr *net.UDPAddr
+
+	// Optional in-memory datagram path (see AttachDatagrams); nil means UDP.
+	inbound <-chan []byte
+	sendOut func([]byte)
 
 	started chan struct{} // closed when PTY is running
 	done    chan struct{}
@@ -75,6 +93,27 @@ func GenerateKey() ([]byte, string, error) {
 // NewServer creates a native mosh server.
 // It binds a UDP port, generates a key, and is ready to serve.
 func NewServer(shell string, portLow, portHigh int) (*Server, error) {
+	conn, port, err := BindUDP(portLow, portHigh)
+	if err != nil {
+		return nil, err
+	}
+	srv, err := newServer(shell)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	srv.conn = conn
+	srv.port = port
+	return srv, nil
+}
+
+// NewServerIO creates a server with no UDP socket. Call AttachDatagrams before
+// Serve to carry mosh datagrams over another transport (e.g. a WebRTC channel).
+func NewServerIO(shell string) (*Server, error) {
+	return newServer(shell)
+}
+
+func newServer(shell string) (*Server, error) {
 	key, _, err := GenerateKey()
 	if err != nil {
 		return nil, err
@@ -91,16 +130,9 @@ func NewServer(shell string, portLow, portHigh int) (*Server, error) {
 		}
 	}
 
-	conn, port, err := BindUDP(portLow, portHigh)
-	if err != nil {
-		return nil, err
-	}
-
 	return &Server{
 		key:       key,
 		ocb:       ocb,
-		port:      port,
-		conn:      conn,
 		shell:     shell,
 		cols:      defaultCols,
 		rows:      defaultRows,
@@ -108,6 +140,24 @@ func NewServer(shell string, portLow, portHigh int) (*Server, error) {
 		started:   make(chan struct{}),
 		done:      make(chan struct{}),
 	}, nil
+}
+
+// AttachDatagrams moves the server off UDP: inbound yields client datagrams and
+// send delivers server datagrams back. Closing inbound shuts the server down.
+func (s *Server) AttachDatagrams(inbound <-chan []byte, send func([]byte)) {
+	s.mu.Lock()
+	s.inbound = inbound
+	s.sendOut = send
+	s.clientAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)} // connectionless: no NAT to learn
+	s.mu.Unlock()
+}
+
+// Kill terminates the shell process, which ends Serve.
+func (s *Server) Kill() error {
+	if s.cmd != nil && s.cmd.Process != nil {
+		return s.cmd.Process.Kill()
+	}
+	return nil
 }
 
 // Port returns the UDP port the server is listening on.
@@ -140,7 +190,9 @@ func (s *Server) Serve() error {
 	var err error
 	s.ptmx, err = pty.Start(s.cmd)
 	if err != nil {
-		s.conn.Close()
+		if s.conn != nil {
+			s.conn.Close()
+		}
 		return fmt.Errorf("pty: %w", err)
 	}
 	close(s.started)
@@ -156,6 +208,7 @@ func (s *Server) Serve() error {
 		CursorVisibility: func(visible bool) { s.curVisible.Store(visible) },
 	})
 	s.baseFB = NewFramebuffer(s.cols, s.rows)
+	go s.drainReplies(s.ptmx)
 
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -183,7 +236,9 @@ func (s *Server) Serve() error {
 	err = s.cmd.Wait()
 	close(s.done)
 	s.ptmx.Close()
-	s.conn.Close()
+	if s.conn != nil {
+		s.conn.Close()
+	}
 	wg.Wait()
 	return err
 }
@@ -191,6 +246,52 @@ func (s *Server) Serve() error {
 // Done returns a channel that is closed when the server shuts down.
 func (s *Server) Done() <-chan struct{} {
 	return s.done
+}
+
+// drainReplies forwards emulator query responses (DECRQM, DA, OSC palette
+// queries) back to the application. vt-go writes them to an unbuffered pipe,
+// so without a reader the emulator blocks forever on the first query.
+func (s *Server) drainReplies(w io.Writer) {
+	if w == nil {
+		return
+	}
+	buf := make([]byte, 1024)
+	for {
+		n, err := s.emu.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// withModes prepends pending mouse-tracking mode changes to a diff: rendered
+// diffs carry cells only, never the raw mode escapes the application emitted.
+// Duplicates are harmless (enabling a mode twice is idempotent) and are
+// cleared once the client acks the frame.
+func (s *Server) withModes(diff []byte) []byte {
+	if len(s.pendingModes) == 0 {
+		return diff
+	}
+	out := make([]byte, 0, len(s.pendingModes)+len(diff))
+	out = append(out, s.pendingModes...)
+	return append(out, diff...)
+}
+
+// captureModes records mouse-tracking mode changes from raw PTY output.
+func (s *Server) captureModes(data []byte) {
+	for _, m := range decModeRe.FindAllSubmatch(data, -1) {
+		for _, p := range strings.Split(string(m[1]), ";") {
+			if mouseModes[p] {
+				s.pendingModes = append(s.pendingModes, m[0]...)
+				break
+			}
+		}
+	}
 }
 
 // ServeRW runs the event loop using an external io.ReadWriteCloser instead
@@ -205,6 +306,7 @@ func (s *Server) ServeRW(rw io.ReadWriteCloser, resize func(cols, rows uint16)) 
 		CursorVisibility: func(visible bool) { s.curVisible.Store(visible) },
 	})
 	s.baseFB = NewFramebuffer(s.cols, s.rows)
+	go s.drainReplies(rw)
 
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -292,6 +394,7 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 			if !ok {
 				return
 			}
+			s.captureModes(data)
 			s.emu.Write(data)
 			dirty = true
 
@@ -299,7 +402,7 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 			if len(ui.Keys) > 0 {
 				rw.Write(ui.Keys)
 			}
-			if ui.Width > 0 && ui.Height > 0 {
+			if ui.Width > 0 && ui.Height > 0 && (int(ui.Width) != s.cols || int(ui.Height) != s.rows) {
 				s.mu.Lock()
 				s.cols = int(ui.Width)
 				s.rows = int(ui.Height)
@@ -310,6 +413,7 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 				s.emu.Resize(int(ui.Width), int(ui.Height))
 				s.baseFB = NewFramebuffer(int(ui.Width), int(ui.Height))
 				s.sentFB = nil
+				s.transport.ResetDiffBase()
 				dirty = true
 			}
 
@@ -317,11 +421,12 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 			if s.sentFB != nil && s.transport.AckedByRemote() >= s.transport.SentNum() {
 				s.baseFB = s.sentFB
 				s.sentFB = nil
+				s.pendingModes = nil
 			}
 
 			if dirty {
 				currentFB := SnapshotEmulator(s.emu, s.curVisible.Load())
-				diffBytes := currentFB.Diff(s.baseFB)
+				diffBytes := s.withModes(currentFB.Diff(s.baseFB))
 				if len(diffBytes) > 0 {
 					hi := HostInstruction{Hoststring: diffBytes, EchoAckNum: -1}
 					s.transport.SetPending(marshalHostMessage([]HostInstruction{hi}))
@@ -397,6 +502,7 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 			if !ok {
 				return
 			}
+			s.captureModes(data)
 			s.emu.Write(data)
 			dirty = true
 
@@ -404,7 +510,7 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 			if len(ui.Keys) > 0 {
 				s.ptmx.Write(ui.Keys)
 			}
-			if ui.Width > 0 && ui.Height > 0 {
+			if ui.Width > 0 && ui.Height > 0 && (int(ui.Width) != s.cols || int(ui.Height) != s.rows) {
 				s.mu.Lock()
 				s.cols = int(ui.Width)
 				s.rows = int(ui.Height)
@@ -416,6 +522,7 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 				s.emu.Resize(int(ui.Width), int(ui.Height))
 				s.baseFB = NewFramebuffer(int(ui.Width), int(ui.Height))
 				s.sentFB = nil
+				s.transport.ResetDiffBase()
 				dirty = true
 			}
 
@@ -424,11 +531,12 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 			if s.sentFB != nil && s.transport.AckedByRemote() >= s.transport.SentNum() {
 				s.baseFB = s.sentFB
 				s.sentFB = nil
+				s.pendingModes = nil
 			}
 
 			if dirty {
 				currentFB := SnapshotEmulator(s.emu, s.curVisible.Load())
-				diffBytes := currentFB.Diff(s.baseFB)
+				diffBytes := s.withModes(currentFB.Diff(s.baseFB))
 				if len(diffBytes) > 0 {
 					hi := HostInstruction{Hoststring: diffBytes, EchoAckNum: -1}
 					s.transport.SetPending(marshalHostMessage([]HostInstruction{hi}))
@@ -473,6 +581,9 @@ func (s *Server) readPTY(out chan<- []byte) {
 // recvUDP reads encrypted datagrams, decrypts via transport, parses UserMessage.
 func (s *Server) recvUDP(out chan<- UserInstruction) {
 	buf := make([]byte, maxPayload+64)
+	s.mu.Lock()
+	inbound := s.inbound
+	s.mu.Unlock()
 
 	for {
 		select {
@@ -481,30 +592,54 @@ func (s *Server) recvUDP(out chan<- UserInstruction) {
 		default:
 		}
 
-		s.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		n, addr, err := s.conn.ReadFromUDP(buf)
-		if err != nil {
-			if os.IsTimeout(err) {
-				if time.Since(s.transport.LastRecv()) > defaultNetworkTimeout {
+		var (
+			data []byte
+			addr *net.UDPAddr
+			err  error
+		)
+
+		if inbound != nil {
+			select {
+			case <-s.done:
+				return
+			case dg, ok := <-inbound:
+				if !ok {
 					return
 				}
+				if len(dg) < minDatagram {
+					continue
+				}
+				data = dg
+				addr = nil
+			}
+		} else {
+			s.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+			var n int
+			n, addr, err = s.conn.ReadFromUDP(buf)
+			if err != nil {
+				if os.IsTimeout(err) {
+					if time.Since(s.transport.LastRecv()) > defaultNetworkTimeout {
+						return
+					}
+					continue
+				}
+				return
+			}
+			if n < minDatagram {
 				continue
 			}
-			return
+			data = make([]byte, n)
+			copy(data, buf[:n])
 		}
-		if n < minDatagram {
-			continue
-		}
-
-		data := make([]byte, n)
-		copy(data, buf[:n])
 
 		// Feed to transport — only update clientAddr on successful decrypt.
 		diff := s.transport.Recv(data)
 
-		s.mu.Lock()
-		s.clientAddr = addr
-		s.mu.Unlock()
+		if addr != nil {
+			s.mu.Lock()
+			s.clientAddr = addr
+			s.mu.Unlock()
+		}
 
 		if diff == nil {
 			continue
@@ -529,7 +664,14 @@ func (s *Server) recvUDP(out chan<- UserInstruction) {
 func (s *Server) sendDatagrams(datagrams [][]byte) {
 	s.mu.Lock()
 	addr := s.clientAddr
+	send := s.sendOut
 	s.mu.Unlock()
+	if send != nil {
+		for _, dg := range datagrams {
+			send(dg)
+		}
+		return
+	}
 	if addr == nil {
 		return
 	}

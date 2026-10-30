@@ -4,6 +4,7 @@ package main
 
 import (
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +13,9 @@ import (
 )
 
 var decModeRe = regexp.MustCompile(`\x1b\[\?([0-9;]+)([hl])`)
+
+// mouseModes are the DEC private modes xterm.js must see to capture pointer input.
+var mouseModes = map[string]bool{"9": true, "1000": true, "1002": true, "1003": true, "1005": true, "1006": true, "1015": true, "1016": true}
 
 // stateTracker implements Dart-style received state management.
 // Each incoming diff is applied to a copy of the base state (looked up
@@ -93,20 +97,21 @@ func (st *stateTracker) applyDiff(diff []byte, oldNum, newNum, throwawayNum uint
 	if err != nil {
 		return false
 	}
-	var controlEscapes []byte
 	for _, hi := range instrs {
 		if len(hi.Hoststring) > 0 {
 			st.shadow.Write(hi.Hoststring)
-			// Pass DEC private mode sequences (mouse tracking 1000/1002/1003/1006, cursor 25, alt screen 1049)
-			// directly to the terminal emulator so xterm.js activates mouse capture.
-			matches := decModeRe.FindAll(hi.Hoststring, -1)
-			for _, m := range matches {
-				controlEscapes = append(controlEscapes, m...)
+			// Forward mouse-tracking DEC modes directly to xterm.js output: the
+			// shadow emulator's Diff() emits only rendered character cells, so
+			// without this xterm.js never activates mouse reporting.
+			for _, m := range decModeRe.FindAllSubmatch(hi.Hoststring, -1) {
+				for _, p := range strings.Split(string(m[1]), ";") {
+					if mouseModes[p] {
+						st.output = append(st.output, m[0]...)
+						break
+					}
+				}
 			}
 		}
-	}
-	if len(controlEscapes) > 0 {
-		st.output = append(st.output, controlEscapes...)
 	}
 	st.shadowState = newNum
 
