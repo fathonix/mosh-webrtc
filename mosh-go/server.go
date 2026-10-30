@@ -9,10 +9,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -268,6 +270,29 @@ func (s *Server) Done() <-chan struct{} {
 	return s.done
 }
 
+// StillAtLogin reports whether the PTY is still waiting for credentials, i.e.
+// nobody has authenticated yet.
+// macOS login(1) does not exec the shell in place: it stays as the parent and
+// waits, so the shell appears as its child only after a successful login.
+// shortcut: relies on `ps -o comm=` and `pgrep -P` (macOS + procps); revisit if
+// a platform without them must be supported.
+func (s *Server) StillAtLogin() bool {
+	if s.cmd == nil || s.cmd.Process == nil {
+		return false
+	}
+	pid := s.cmd.Process.Pid
+	out, err := exec.Command("ps", "-o", "comm=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return false // process gone: session is over anyway
+	}
+	name := strings.TrimSpace(string(out))
+	if name != "login" && !strings.HasSuffix(name, "/login") {
+		return false
+	}
+	kids, err := exec.Command("pgrep", "-P", strconv.Itoa(pid)).Output()
+	return err != nil || strings.TrimSpace(string(kids)) == ""
+}
+
 // drainReplies forwards emulator query responses (DECRQM, DA, OSC palette
 // queries) back to the application. vt-go writes them to an unbuffered pipe,
 // so without a reader the emulator blocks forever on the first query.
@@ -310,17 +335,29 @@ const maxLoginFailures = 5
 // logins. The tail is kept so a message split across two PTY reads still matches.
 func (s *Server) countAuthFailures(data []byte) bool {
 	s.scanTail = append(s.scanTail, data...)
+	matched := false
 	for {
 		i := bytes.Index(s.scanTail, []byte("Login incorrect"))
 		if i < 0 {
 			break
 		}
 		s.scanTail = s.scanTail[i+len("Login incorrect"):]
-		s.authFailures++
+		matched = true
 	}
 	if len(s.scanTail) > 32 {
 		s.scanTail = s.scanTail[len(s.scanTail)-32:]
 	}
+	if !matched {
+		return false
+	}
+	// Once login(1) has exec'd the shell, any "Login incorrect" in the output is
+	// just text the shell printed (a diff, a log, this source file) — only
+	// login(1) itself can reject a password.
+	if !s.StillAtLogin() {
+		s.authFailures = 0
+		return false
+	}
+	s.authFailures++
 	return s.authFailures >= maxLoginFailures
 }
 
@@ -438,6 +475,7 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 			}
 			s.captureModes(data)
 			if s.countAuthFailures(data) && s.cmd != nil && s.cmd.Process != nil {
+				log.Printf("[INFO] killing shell: %d failed logins", maxLoginFailures)
 				s.cmd.Process.Kill()
 			}
 			s.emu.Write(data)
@@ -447,31 +485,37 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 			if len(ui.Keys) > 0 {
 				rw.Write(ui.Keys)
 			}
-			if ui.Width > 0 && ui.Height > 0 && (int(ui.Width) != s.cols || int(ui.Height) != s.rows) {
-				s.mu.Lock()
-				s.cols = int(ui.Width)
-				s.rows = int(ui.Height)
-				s.mu.Unlock()
-				if resize != nil {
-					resize(uint16(ui.Width), uint16(ui.Height))
+			if ui.Width > 0 && ui.Height > 0 {
+				// The client resends its size right after re-attaching a
+				// DataChannel. Anything sent before that attach was lost, so
+				// repaint from scratch here, not only when the size changed.
+				if int(ui.Width) != s.cols || int(ui.Height) != s.rows {
+					s.mu.Lock()
+					s.cols = int(ui.Width)
+					s.rows = int(ui.Height)
+					s.mu.Unlock()
+					if resize != nil {
+						resize(uint16(ui.Width), uint16(ui.Height))
+					}
+					s.emu.Resize(int(ui.Width), int(ui.Height))
 				}
-				s.emu.Resize(int(ui.Width), int(ui.Height))
-				s.baseFB = NewFramebuffer(int(ui.Width), int(ui.Height))
-				s.sentFB = nil
-				s.transport.ResetDiffBase()
+				s.forceRedraw()
 				dirty = true
 			}
 
 		case <-s.resync:
-			s.mu.Lock()
-			cols, rows := s.cols, s.rows
-			s.mu.Unlock()
-			s.baseFB = NewFramebuffer(cols, rows)
-			s.sentFB = nil
-			s.transport.ResetDiffBase()
+			s.forceRedraw()
 			dirty = true
 
 		case <-ticker.C:
+			// If our outgoing diff has gone unacked for over 1.5s, the client
+			// cannot apply it (base state was lost during reconnect/packet loss).
+			// Wipe the base so the next diff is a full redraw from state 0.
+			if s.transport.Stale(3 * time.Second) {
+				s.forceRedraw()
+				dirty = true
+			}
+
 			if s.sentFB != nil && s.transport.AckedByRemote() >= s.transport.SentNum() {
 				s.baseFB = s.sentFB
 				s.sentFB = nil
@@ -518,6 +562,15 @@ func (s *Server) Close() {
 	}
 }
 
+func (s *Server) forceRedraw() {
+	s.mu.Lock()
+	cols, rows := s.cols, s.rows
+	s.mu.Unlock()
+	s.baseFB = NewFramebuffer(cols, rows)
+	s.sentFB = nil
+	s.transport.ResetDiffBase()
+}
+
 // mainLoop is the SSP event loop. It feeds PTY output to a VT emulator,
 // snapshots the framebuffer, diffs against the last-acked state, and
 // sends CUP-based updates via the transport.
@@ -558,6 +611,7 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 			}
 			s.captureModes(data)
 			if s.countAuthFailures(data) && s.cmd != nil && s.cmd.Process != nil {
+				log.Printf("[INFO] killing shell: %d failed logins", maxLoginFailures)
 				s.cmd.Process.Kill()
 			}
 			s.emu.Write(data)
@@ -567,32 +621,38 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 			if len(ui.Keys) > 0 {
 				s.ptmx.Write(ui.Keys)
 			}
-			if ui.Width > 0 && ui.Height > 0 && (int(ui.Width) != s.cols || int(ui.Height) != s.rows) {
-				s.mu.Lock()
-				s.cols = int(ui.Width)
-				s.rows = int(ui.Height)
-				s.mu.Unlock()
-				pty.Setsize(s.ptmx, &pty.Winsize{
-					Cols: uint16(ui.Width),
-					Rows: uint16(ui.Height),
-				})
-				s.emu.Resize(int(ui.Width), int(ui.Height))
-				s.baseFB = NewFramebuffer(int(ui.Width), int(ui.Height))
-				s.sentFB = nil
-				s.transport.ResetDiffBase()
+			if ui.Width > 0 && ui.Height > 0 {
+				// The client resends its size right after re-attaching a
+				// DataChannel. Anything sent before that attach was lost, so
+				// repaint from scratch here, not only when the size changed.
+				if int(ui.Width) != s.cols || int(ui.Height) != s.rows {
+					s.mu.Lock()
+					s.cols = int(ui.Width)
+					s.rows = int(ui.Height)
+					s.mu.Unlock()
+					pty.Setsize(s.ptmx, &pty.Winsize{
+						Cols: uint16(ui.Width),
+						Rows: uint16(ui.Height),
+					})
+					s.emu.Resize(int(ui.Width), int(ui.Height))
+				}
+				s.forceRedraw()
 				dirty = true
 			}
 
 		case <-s.resync:
-			s.mu.Lock()
-			cols, rows := s.cols, s.rows
-			s.mu.Unlock()
-			s.baseFB = NewFramebuffer(cols, rows)
-			s.sentFB = nil
-			s.transport.ResetDiffBase()
+			s.forceRedraw()
 			dirty = true
 
 		case <-ticker.C:
+			// If our outgoing diff has gone unacked for over 1.5s, the client
+			// cannot apply it (base state was lost during reconnect/packet loss).
+			// Wipe the base so the next diff is a full redraw from state 0.
+			if s.transport.Stale(3 * time.Second) {
+				s.forceRedraw()
+				dirty = true
+			}
+
 			// Advance base when client acks all pending.
 			if s.sentFB != nil && s.transport.AckedByRemote() >= s.transport.SentNum() {
 				s.baseFB = s.sentFB

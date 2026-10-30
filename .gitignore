@@ -1,5 +1,6 @@
 # build artifacts
 mosh-webrtc-server
+mosh-webrtc
 web/static/mosh.wasm
 mosh-go/mosh-wasm
 mosh-go/remote-test

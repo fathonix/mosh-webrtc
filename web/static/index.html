@@ -10,6 +10,24 @@
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-unicode11@0.6.0/lib/xterm-addon-unicode11.js"></script>
     <script src="wasm_exec.js"></script>
     <style>
+        @font-face {
+            font-family: "Spleen 32x64";
+            src: url("spleen-32x64.woff2") format("woff2"),
+                 url("spleen-32x64.woff") format("woff");
+            font-display: block;
+        }
+        @font-face {
+            font-family: "Spleen 8x16";
+            src: url("spleen-8x16.woff2") format("woff2"),
+                 url("spleen-8x16.woff") format("woff");
+            font-display: block;
+        }
+        @font-face {
+            font-family: "Spleen 16x32";
+            src: url("spleen-16x32.woff2") format("woff2"),
+                 url("spleen-16x32.woff") format("woff");
+            font-display: block;
+        }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body, html {
             height: 100%;
@@ -39,6 +57,7 @@
             display: inline-block;
             width: 8px;
             height: 8px;
+            flex: 0 0 8px;
             border-radius: 50%;
             background-color: #f7768e;
         }
@@ -56,6 +75,17 @@
             gap: 10px;
             align-items: center;
         }
+        @media (max-width: 600px) {
+            #header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 8px;
+            }
+            .controls {
+                flex-wrap: wrap;
+                justify-content: flex-start;
+            }
+        }
         button {
             background: #7aa2f7;
             color: #15161e;
@@ -65,6 +95,16 @@
             font-weight: 600;
             cursor: pointer;
             font-size: 13px;
+        }
+        select.font-select {
+            background: #24283b;
+            color: #c0caf5;
+            border: 1px solid #414868;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 13px;
+            cursor: pointer;
+            outline: none;
         }
         button:hover { background: #89b4fa; }
         button:disabled { background: #414868; color: #787c99; cursor: not-allowed; }
@@ -83,7 +123,8 @@
             <span id="status-text">Disconnected</span>
         </div>
         <div class="controls">
-            <button id="retry-btn" class="secondary" onclick="retryConnection()" style="display: none;">Retry / Redraw</button>
+            <select id="font-size" class="font-select" title="Font size"></select>
+            <button id="retry-btn" class="secondary" onclick="retryConnection()" style="display: none;">Retry</button>
             <button id="connect-btn" onclick="startMosh()">Connect</button>
         </div>
     </div>
@@ -94,12 +135,36 @@
         const statusText = document.getElementById("status-text");
         const connectBtn = document.getElementById("connect-btn");
         const retryBtn = document.getElementById("retry-btn");
+        const fontSelect = document.getElementById("font-size");
 
+        // fontSize is the font's em size; Spleen's bitmap grid is half that, so
+        // fontSize 16 renders 8x16 cells at 1:1 pixels (no interpolation).
+        // spacing widens the cell a little; the 8x16 grid is tight otherwise.
+        const FONT_PRESETS = [
+            { label: "8x16 (Tiny)", family: '"Spleen 8x16", monospace', size: 16, spacing: 1 },
+            { label: "16x32 (Medium)", family: '"Spleen 16x32", monospace', size: 32, spacing: 0 },
+            { label: "32x64 (Large)", family: '"Spleen 32x64", monospace', size: 64, spacing: 0 }
+        ];
+        let currentPresetIdx = FONT_PRESETS.findIndex(
+            p => p.size === Number(localStorage.getItem("mosh_font_px"))
+        );
+        if (currentPresetIdx < 0) currentPresetIdx = 0; // default: 8x16
+
+        FONT_PRESETS.forEach((p, i) => {
+            const opt = document.createElement("option");
+            opt.value = i;
+            opt.textContent = p.label;
+            opt.selected = i === currentPresetIdx;
+            fontSelect.appendChild(opt);
+        });
+
+        const activePreset = FONT_PRESETS[currentPresetIdx];
         const term = new Terminal({
             allowProposedApi: true,
             cursorBlink: true,
-            fontSize: 14,
-            fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+            fontSize: activePreset.size,
+            fontFamily: activePreset.family,
+            letterSpacing: activePreset.spacing || 0,
             theme: {
                 background: '#1a1b26',
                 foreground: '#c0caf5',
@@ -117,6 +182,29 @@
         // Right click is a terminal mouse report, not a browser menu.
         termContainer.addEventListener('contextmenu', e => e.preventDefault());
         fitAddon.fit();
+        // The first measure can run before the webfont is ready; re-fit once it is.
+        document.fonts.ready.then(() => {
+            fitAddon.fit();
+            if (moshSession) moshSession.resize(term.cols, term.rows);
+        });
+
+        fontSelect.addEventListener("change", async (e) => {
+            const idx = Number(e.target.value);
+            const preset = FONT_PRESETS[idx];
+            if (!preset) return;
+            localStorage.setItem("mosh_font_px", preset.size);
+            await document.fonts.load(`${preset.size}px ${preset.family.split(',')[0]}`);
+            term.options.fontFamily = preset.family;
+            term.options.fontSize = preset.size;
+            term.options.letterSpacing = preset.spacing || 0;
+            fitAddon.fit();
+            if (moshSession) {
+                moshSession.resize(term.cols, term.rows);
+                const redraw = moshSession.redraw();
+                if (redraw) term.write(redraw);
+            }
+            term.focus();
+        });
 
         let lastCols = term.cols;
         let lastRows = term.rows;
@@ -142,9 +230,28 @@
         let wasmLoaded = false;
         async function loadWasm() {
             if (wasmLoaded) return;
-            statusText.textContent = "Loading Mosh WASM...";
             const go = new Go();
-            const result = await WebAssembly.instantiateStreaming(fetch("mosh.wasm"), go.importObject);
+            const fmt = n => n >= 1048576 ? (n / 1048576).toFixed(2) + " MB" : Math.ceil(n / 1024) + " KB";
+            const resp = await fetch("mosh.wasm");
+            const total = Number(resp.headers.get("X-File-Size") || resp.headers.get("Content-Length")) || 0;
+            const chunks = [];
+            let received = 0;
+            const render = () => {
+                statusText.textContent = `Loading Mosh WASM (${fmt(received)}${total ? "/" + fmt(total) : ""})`;
+            };
+            render();
+            const reader = resp.body.getReader();
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunks.push(value);
+                received += value.length;
+                render();
+            }
+            const bytes = new Uint8Array(received);
+            let off = 0;
+            for (const c of chunks) { bytes.set(c, off); off += c.length; }
+            const result = await WebAssembly.instantiate(bytes, go.importObject);
             go.run(result.instance);
             wasmLoaded = true;
         }
@@ -174,6 +281,19 @@
         let currentSessionId = null;
         let isReconnecting = false;
         let termInputHooked = false;
+
+        let cachedIceServers = null;
+        let cachedIceExpiry = 0;
+        async function getIceServers() {
+            if (cachedIceServers && Date.now() < cachedIceExpiry) {
+                return cachedIceServers;
+            }
+            const res = await fetch("/api/config");
+            const data = await res.json();
+            cachedIceServers = data.iceServers;
+            cachedIceExpiry = Date.now() + 60 * 60 * 1000; // cache 1h client-side
+            return cachedIceServers;
+        }
 
         async function createAndOffer(pc, sessionId = null) {
             const offer = await pc.createOffer();
@@ -223,10 +343,9 @@
                     activePC = null;
                 }
 
-                const configResp = await fetch("/api/config");
-                const config = await configResp.json();
+                const iceServers = await getIceServers();
 
-                const newPC = new RTCPeerConnection({ iceServers: config.iceServers });
+                const newPC = new RTCPeerConnection({ iceServers });
                 activePC = newPC;
 
                 const newDC = newPC.createDataChannel("mosh", {
@@ -261,6 +380,7 @@
                 statusBadge.className = "badge connected";
                 statusText.textContent = "Connected (Roamed)";
                 retryBtn.style.display = "inline-block";
+                moshSession.resize(term.cols, term.rows);
                 moshSession.tick();
                 // Redraw latest state to guarantee screen is refreshed after reconnection
                 const redraw = moshSession.redraw();
@@ -337,6 +457,25 @@
             triggerReconnect("Online");
         });
 
+        // ICE can sit in "connected" on a dead path (TURN permission expired, one-way
+        // loss). Watch the SSP traffic itself: no incoming datagram, or unacked
+        // keystrokes, for 6s means the link is dead even though ICE disagrees.
+        var lastWatchdogReconnect = 0;
+        function startWatchdog() {
+            if (window.__mlWatchdog) return;
+            window.__mlWatchdog = setInterval(() => {
+                if (!moshSession || !activeDC || activeDC.readyState !== "open" || isReconnecting) return;
+                if (Date.now() - lastWatchdogReconnect < 10000) return;
+                const down = moshSession.sinceRecvMs();
+                const up = moshSession.unackedMs();
+                if (down > 6000 || up > 6000) {
+                    console.log("[Watchdog] link stalled", down, up);
+                    lastWatchdogReconnect = Date.now();
+                    triggerReconnect("Link stalled");
+                }
+            }, 2000);
+        }
+
         async function startMosh() {
             connectBtn.disabled = true;
             statusBadge.className = "badge connecting";
@@ -345,14 +484,13 @@
             try {
                 await loadWasm();
 
-                const configResp = await fetch("/api/config");
-                const config = await configResp.json();
+                const iceServers = await getIceServers();
 
                 if (activePC) {
                     try { activePC.close(); } catch (_) {}
                 }
 
-                const pc = new RTCPeerConnection({ iceServers: config.iceServers });
+                const pc = new RTCPeerConnection({ iceServers });
                 activePC = pc;
                 setupPeerConnectionHooks(pc);
 
@@ -385,6 +523,7 @@
                 fitAddon.fit();
                 moshSession = await moshConnectRTC(dc, data.key, term.cols, term.rows);
                 moshSession.resize(term.cols, term.rows);
+                startWatchdog();
                 moshSession.tick();
                 term.focus();
 

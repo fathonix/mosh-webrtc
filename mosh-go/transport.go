@@ -52,9 +52,10 @@ type Transport struct {
 	seqInMaxSet bool // false until first datagram received
 
 	// Timestamps.
-	lastSend time.Time
-	lastRecv time.Time
-	lastTS   uint16 // last remote timestamp for echo
+	lastSend     time.Time
+	lastRecv     time.Time
+	lastTS       uint16    // last remote timestamp for echo
+	unackedSince time.Time // when sentNum first outran ackedByRemote; zero when all acked
 
 	// RTT estimation (Jacobson/Karels).
 	srtt    time.Duration
@@ -150,7 +151,15 @@ func (t *Transport) ResetDiffBase() {
 	t.hasPendingBase = false
 	t.diffSent = false
 	t.pendingDiff = nil
+	t.unackedSince = time.Time{}
 	t.mu.Unlock()
+}
+
+// Stale reports whether a diff we sent has gone unacked for longer than d. The
+// client is then not applying our diffs (lost base, dropped datagram), so it
+// needs a full repaint from state 0 rather than another incremental diff.
+func (t *Transport) Stale(d time.Duration) bool {
+	return t.UnackedDuration() > d
 }
 
 // Tick produces outgoing wire datagrams if it's time to send.
@@ -181,6 +190,9 @@ func (t *Transport) Tick() [][]byte {
 		if !t.hasPendingBase {
 			t.diffOldNum = t.ackedByRemote
 			t.hasPendingBase = true
+		}
+		if t.unackedSince.IsZero() {
+			t.unackedSince = now
 		}
 	}
 	t.pendingDataAck = false
@@ -316,6 +328,9 @@ func (t *Transport) Recv(wire []byte) []byte {
 			t.diffSent = false
 			t.hasPendingBase = false
 		}
+		if t.ackedByRemote >= t.sentNum {
+			t.unackedSince = time.Time{}
+		}
 	}
 
 	// Check if we already have new_num (dedup).
@@ -438,6 +453,17 @@ func (t *Transport) LastRecv() time.Time {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.lastRecv
+}
+
+// UnackedDuration returns how long sent actions (keystrokes) have been waiting
+// for remote ack. Returns 0 if everything sent is acked.
+func (t *Transport) UnackedDuration() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.unackedSince.IsZero() || t.ackedByRemote >= t.sentNum {
+		return 0
+	}
+	return time.Since(t.unackedSince)
 }
 
 // RTO returns the current retransmission timeout.

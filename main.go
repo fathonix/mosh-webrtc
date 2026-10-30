@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,8 @@ var (
 	iceCached []webrtc.ICEServer
 	iceExpiry time.Time
 )
+
+const loginGracePeriod = 10 * time.Minute
 
 // newSessionID returns an unguessable session identifier: it is the only thing
 // needed to re-attach to a live shell, so it must not be predictable.
@@ -79,6 +82,76 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
+// maxSessions caps concurrent shells so a flood of offers cannot exhaust PIDs.
+func maxSessions() int {
+	n, err := strconv.Atoi(getEnv("MAX_SESSIONS", "8"))
+	if err != nil || n < 1 {
+		return 8
+	}
+	return n
+}
+
+func envInt(key string, fallback int) int {
+	n, err := strconv.Atoi(getEnv(key, ""))
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+// rateLimiter is a fixed-window per-IP request counter for the signaling
+// endpoints. RATE_LIMIT_PER_MIN=0 disables it.
+type rateLimiter struct {
+	mu     sync.Mutex
+	limit  int
+	hits   map[string]int
+	reset  time.Time
+}
+
+var offerRL *rateLimiter
+
+func newRateLimiter(limit int) *rateLimiter {
+	return &rateLimiter{limit: limit, hits: make(map[string]int)}
+}
+
+func (rl *rateLimiter) allow(ip string, now time.Time) bool {
+	if rl.limit <= 0 {
+		return true
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	if now.After(rl.reset) {
+		rl.hits = make(map[string]int)
+		rl.reset = now.Add(time.Minute)
+	}
+	rl.hits[ip]++
+	return rl.hits[ip] <= rl.limit
+}
+
+// clientIP prefers the Cloudflare-set header; RemoteAddr is the tunnel
+// (always 127.0.0.1) when running behind cloudflared.
+func clientIP(r *http.Request) string {
+	if ip := r.Header.Get("CF-Connecting-IP"); ip != "" {
+		return ip
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func withRateLimit(rl *rateLimiter, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !rl.allow(clientIP(r), time.Now()) {
+			w.Header().Set("Retry-After", "60")
+			http.Error(w, "Too many requests", http.StatusTooManyRequests)
+			return
+		}
+		next(w, r)
+	}
+}
+
 func fetchCloudflareICEServers() ([]webrtc.ICEServer, error) {
 	keyID := os.Getenv("CF_TURN_KEY_ID")
 	apiToken := os.Getenv("CF_TURN_KEY_API_TOKEN")
@@ -93,7 +166,7 @@ func fetchCloudflareICEServers() ([]webrtc.ICEServer, error) {
 	}
 
 	url := fmt.Sprintf("https://rtc.live.cloudflare.com/v1/turn/keys/%s/credentials/generate-ice-servers", keyID)
-	reqBody, _ := json.Marshal(map[string]int{"ttl": 86400})
+	reqBody, _ := json.Marshal(map[string]int{"ttl": 7200})
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return servers, err
@@ -187,7 +260,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		SDP       string `json:"sdp"`
 		SessionID string `json:"sessionId"` // if reconnecting/roaming
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10)).Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
@@ -218,7 +291,22 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[INFO] Reconnecting client to existing session %s", req.SessionID)
 		}
 	}
+	atCapacity := len(sessions) >= maxSessions()
 	sessionsMu.Unlock()
+
+	if !isReconnect && offerRL != nil && !offerRL.allow(clientIP(r), time.Now()) {
+		peerConnection.Close()
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "Too many requests", http.StatusTooManyRequests)
+		return
+	}
+
+	if !isReconnect && atCapacity {
+		peerConnection.Close()
+		log.Printf("[WARN] Rejecting new session: at capacity (%d)", maxSessions())
+		http.Error(w, "Too many active sessions", http.StatusServiceUnavailable)
+		return
+	}
 
 	if !isReconnect {
 		moshSrv, inbound, outbound, err := startMoshServer()
@@ -278,6 +366,18 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 			endSession(s, "shell exited")
 		}(sess)
 
+		// A session nobody logged into is just an idle PTY and a TURN
+		// allocation; reclaim it once the login grace period is up.
+		go func(s *Session) {
+			select {
+			case <-time.After(loginGracePeriod):
+				if s.Server.StillAtLogin() {
+					endSession(s, "login timed out")
+				}
+			case <-s.Server.Done():
+			}
+		}(sess)
+
 	} else {
 		// Update the session's active PeerConnection
 		sess.mu.Lock()
@@ -287,10 +387,6 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		sess.PeerConn = peerConnection
 		sess.LastSeen = time.Now()
 		sess.mu.Unlock()
-
-		// Full repaint over the new channel: the client may have missed diffs
-		// while the old transport was dead.
-		sess.Server.TriggerResync()
 	}
 
 	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -319,6 +415,12 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		sess.DataChannel = dc
 		sess.mu.Unlock()
 
+		dc.OnOpen(func() {
+			// Trigger resync only when the channel actually opens and can accept data.
+			// Doing this earlier dropped the full redraw onto a closed channel.
+			sess.Server.TriggerResync()
+		})
+
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			if len(msg.Data) > 0 {
 				cp := make([]byte, len(msg.Data))
@@ -339,6 +441,11 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		SDP:  req.SDP,
 	}
 	if err := peerConnection.SetRemoteDescription(offer); err != nil {
+		peerConnection.Close()
+		if !isReconnect {
+			// A garbage offer must not leave a login PTY behind.
+			endSession(sess, "invalid offer")
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -456,9 +563,11 @@ func main() {
 
 	startReaper()
 
+	offerRL = newRateLimiter(envInt("RATE_LIMIT_PER_MIN", 10))
+
 	mux := http.NewServeMux()
 	mux.Handle("/", fs)
-	mux.HandleFunc("/api/config", handleConfig)
+	mux.HandleFunc("/api/config", withRateLimit(offerRL, handleConfig))
 	mux.HandleFunc("/api/offer", handleOffer)
 	mux.HandleFunc("/api/session/", handleSession)
 
@@ -468,8 +577,17 @@ func main() {
 		log.Println("[INFO] APP_ENV=development: authentication disabled")
 	}
 
-	log.Printf("[INFO] Mosh WebRTC server listening on http://%s", addr)
-	if err := http.ListenAndServe(addr, withAuth(mux)); err != nil {
+	log.Printf("[INFO] Mosh WebRTC server listening on http://%s (max %d sessions, %d req/min/ip)",
+		addr, maxSessions(), envInt("RATE_LIMIT_PER_MIN", 10))
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           withAuth(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("Server exited: %v", err)
 	}
 }

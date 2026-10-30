@@ -265,6 +265,15 @@ func (s *rtcSession) jsObject() js.Value {
 		return nil
 	}))
 
+	// Liveness for the client-side stall watchdog.
+	obj.Set("sinceRecvMs", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		return float64(time.Since(s.client.Transport().LastRecv()).Milliseconds())
+	}))
+
+	obj.Set("unackedMs", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		return float64(s.client.Transport().UnackedDuration().Milliseconds())
+	}))
+
 	obj.Set("poll", js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 		out := s.tracker.poll()
 		if out == nil {
