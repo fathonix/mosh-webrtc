@@ -156,9 +156,13 @@ func fetchCloudflareICEServers() ([]webrtc.ICEServer, error) {
 	keyID := os.Getenv("CF_TURN_KEY_ID")
 	apiToken := os.Getenv("CF_TURN_KEY_API_TOKEN")
 
-	servers := []webrtc.ICEServer{
-		{URLs: []string{"stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"}},
+	// Last-resort STUN list, used when the TURN API is unreachable. Cloudflare's
+	// own response already carries STUN endpoints, so it is not prepended there:
+	// every extra server URL costs another gathering transaction in the browser.
+	stunOnly := []webrtc.ICEServer{
+		{URLs: []string{"stun:stun.cloudflare.com:3478"}},
 	}
+	servers := stunOnly
 
 	if keyID == "" || apiToken == "" {
 		log.Println("[WARN] No CF_TURN_KEY_ID / CF_TURN_KEY_API_TOKEN set; using STUN only")
@@ -199,6 +203,7 @@ func fetchCloudflareICEServers() ([]webrtc.ICEServer, error) {
 		return servers, err
 	}
 
+	servers = nil // Cloudflare's response brings its own STUN entries
 	for _, entry := range cfResp.IceServers {
 		var udpURLs []string
 		for _, u := range entry.URLs {
@@ -215,6 +220,9 @@ func fetchCloudflareICEServers() ([]webrtc.ICEServer, error) {
 			}
 			servers = append(servers, s)
 		}
+	}
+	if len(servers) == 0 {
+		servers = stunOnly
 	}
 	log.Printf("[INFO] Configured %d ICE servers (including Cloudflare TURN)", len(servers))
 	return servers, nil
@@ -259,6 +267,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		SDP       string `json:"sdp"`
 		SessionID string `json:"sessionId"` // if reconnecting/roaming
+		Fresh     bool   `json:"fresh"`     // the client lost its SSP state (page reload)
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10)).Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
@@ -387,6 +396,12 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		sess.PeerConn = peerConnection
 		sess.LastSeen = time.Now()
 		sess.mu.Unlock()
+		if req.Fresh {
+			// A reloaded page is a brand-new SSP peer: without this the server
+			// discards its low sequence numbers as replays and typing goes nowhere.
+			sess.Server.ResetPeer()
+			log.Printf("[INFO] Reset mosh state for refreshed client on session %s", sess.ID)
+		}
 	}
 
 	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {

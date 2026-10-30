@@ -260,6 +260,9 @@
 
         function filterPrivateCandidates(sdp) {
             if (!sdp) return sdp;
+            // Served from localhost: every candidate is host-only by definition, so
+            // dropping them would leave ICE with nothing to pair.
+            if (location.hostname === "localhost" || location.hostname === "127.0.0.1") return sdp;
             return sdp.split("\r\n").filter(line => {
                 if (!line.startsWith("a=candidate")) return true;
                 if (line.includes("typ host") || line.includes(".local")) return false;
@@ -284,6 +287,15 @@
         let isReconnecting = false;
         let termInputHooked = false;
 
+        // The session id is a bearer token for the live PTY, so it stays in
+        // sessionStorage: never the URL, never history, never proxy logs.
+        function rememberSession(id) {
+            try { sessionStorage.setItem("mosh_session_id", id); } catch (_) {}
+        }
+        function forgetSession() {
+            try { sessionStorage.removeItem("mosh_session_id"); } catch (_) {}
+        }
+
         let cachedIceServers = null;
         let cachedIceExpiry = 0;
         async function getIceServers() {
@@ -297,7 +309,7 @@
             return cachedIceServers;
         }
 
-        async function createAndOffer(pc, sessionId = null) {
+        async function createAndOffer(pc, sessionId = null, fresh = false) {
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
 
@@ -320,7 +332,7 @@
             const res = await fetch("/api/offer", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ sdp: cleanOfferSDP, sessionId: sessionId })
+                body: JSON.stringify({ sdp: cleanOfferSDP, sessionId: sessionId, fresh: fresh })
             });
 
             if (!res.ok) {
@@ -425,6 +437,7 @@
 
         function handleSessionTerminated(msg) {
             currentSessionId = null;
+            forgetSession();
             moshSession = null;
             activeDC = null;
             if (activePC) {
@@ -478,14 +491,12 @@
             }, 2000);
         }
 
-        async function startMosh() {
+        async function startMosh(resumeId = null) {
             connectBtn.disabled = true;
             statusBadge.className = "badge connecting";
-            statusText.textContent = "Initializing...";
+            statusText.textContent = resumeId ? "Resuming session..." : "Initializing...";
 
             try {
-                await loadWasm();
-
                 const iceServers = await getIceServers();
 
                 if (activePC) {
@@ -505,8 +516,9 @@
                 setupDataChannelHooks(dc);
 
                 statusText.textContent = "Connecting to gateway...";
-                const data = await createAndOffer(pc, null);
+                const data = await createAndOffer(pc, resumeId, !!resumeId);
                 currentSessionId = data.sessionId;
+                rememberSession(currentSessionId);
 
                 statusText.textContent = "Awaiting WebRTC DataChannel...";
                 await new Promise((resolve, reject) => {
@@ -523,6 +535,9 @@
                 retryBtn.style.display = "inline-block";
 
                 fitAddon.fit();
+                // Signaled first so a resume doesn't wait on the WASM download; the
+                // server redraws the full screen once we attach, so nothing is lost.
+                await loadWasm();
                 moshSession = await moshConnectRTC(dc, data.key, term.cols, term.rows);
                 moshSession.resize(term.cols, term.rows);
                 startWatchdog();
@@ -585,6 +600,30 @@
                 }, 1500);
             }
         }
+        // A page refresh (or tab restore) reattaches to the shell that was already
+        // running in this tab. If the shell has exited or the server reaped it,
+        // forget the stale id silently and leave the UI fresh (Disconnected + Connect).
+        async function resumeStoredSession() {
+            let id = null;
+            try {
+                id = sessionStorage.getItem("mosh_session_id");
+            } catch (_) {
+                return; // private mode / blocked storage: just stay idle
+            }
+            if (!id || currentSessionId) return;
+            if (!(await sessionAlive(id))) {
+                forgetSession();
+                return;
+            }
+            try {
+                await startMosh(id);
+            } catch (_) {
+                forgetSession();
+            }
+        }
+
+        document.fonts.ready.then(resumeStoredSession);
+
     </script>
 </body>
 </html>

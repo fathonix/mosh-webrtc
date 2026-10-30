@@ -71,6 +71,9 @@ type Server struct {
 	// pendingModes holds mouse-tracking mode changes seen on the PTY. The diff
 	// carries only rendered cells, so these must be replayed to the client.
 	pendingModes []byte
+	// modes is the running log of every mode sequence emitted, replayed in full
+	// to a client that reconnects with no state (see ResetPeer).
+	modes []byte
 
 	// Remote client address — set on first received datagram.
 	mu         sync.Mutex
@@ -265,6 +268,16 @@ func (s *Server) TriggerResync() {
 	}
 }
 
+// ResetPeer prepares for a client that lost its SSP state, e.g. a browser
+// refresh: its crypto sequence and state numbering restart at zero, so the
+// server must forget the old peer's and replay the mouse modes it never saw.
+func (s *Server) ResetPeer() {
+	s.transport.ResetPeer()
+	s.mu.Lock()
+	s.pendingModes = append([]byte(nil), s.modes...)
+	s.mu.Unlock()
+}
+
 // Done returns a channel that is closed when the server shuts down.
 func (s *Server) Done() <-chan struct{} {
 	return s.done
@@ -367,6 +380,11 @@ func (s *Server) captureModes(data []byte) {
 		for _, p := range strings.Split(string(m[1]), ";") {
 			if mouseModes[p] {
 				s.pendingModes = append(s.pendingModes, m[0]...)
+				// Keep the log bounded: terminal apps toggle modes rarely, and a
+				// replay only needs the recent history to reach the current state.
+				if len(s.modes) < 4096 {
+					s.modes = append(s.modes, m[0]...)
+				}
 				break
 			}
 		}

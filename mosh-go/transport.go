@@ -162,6 +162,33 @@ func (t *Transport) Stale(d time.Duration) bool {
 	return t.UnackedDuration() > d
 }
 
+// ResetPeer rewinds both SSP directions and the crypto replay counter, so a
+// client that lost its state (browser refresh) can restart at sequence 0 and
+// state 0 without being mistaken for a replayed datagram.
+func (t *Transport) ResetPeer() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// Inbound: sequence guard, reassembly, SSP numbering from the old peer.
+	t.seqInMax = 0
+	t.seqInMaxSet = false
+	t.assembler = FragmentAssembler{}
+	t.receivedNums = []uint64{0}
+	t.ackNum = 0
+	t.sentAckNum = 0
+	t.throwawayNum = 0
+	t.lastRecvOldNum = 0
+	t.lastRecvNewNum = 0
+	// Outbound: the new peer has acked nothing, so numbering restarts too.
+	t.sentNum = 0
+	t.ackedByRemote = 0
+	t.diffOldNum = 0
+	t.hasPendingBase = false
+	t.diffSent = false
+	t.pendingDiff = nil
+	t.pendingDataAck = false
+	t.unackedSince = time.Time{}
+}
+
 // Tick produces outgoing wire datagrams if it's time to send.
 // Returns nil if nothing to send.
 func (t *Transport) Tick() [][]byte {
