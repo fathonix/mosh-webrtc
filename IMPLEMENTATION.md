@@ -110,12 +110,19 @@ dc.binaryType = "arraybuffer";
 - **The Fix** (`mosh-go/server.go`):
   ```go
   func (s *Server) drainReplies(w io.Writer) {
+      if w == nil {
+          return
+      }
       buf := make([]byte, 1024)
       for {
           n, err := s.emu.Read(buf)
-          if err != nil { return }
-          if n > 0 && w != nil {
-              _, _ = w.Write(buf[:n]) // Forward terminal queries straight back to PTY master!
+          if n > 0 {
+              if _, werr := w.Write(buf[:n]); werr != nil {
+                  return
+              }
+          }
+          if err != nil {
+              return
           }
       }
   }
@@ -131,16 +138,16 @@ dc.binaryType = "arraybuffer";
   - **Confirmation-Driven ACKs**: Added `SetCanApply(func(oldNum) bool)` to `mosh-go/transport.go`. ACKs are only sent if the client strictly holds `OldNum` in memory.
   - **Clean Diff Discarding**: If `OldNum` is missing, the WASM client drops the diff and refuses to ACK, forcing the server to re-transmit a diff calculated from the last confirmed state.
 
-### Bug 3: Reconnect Frozen Terminal (SCTP Open Race)
-- **Symptom**: Reconnecting to an existing session showed "Connected", but the screen remained frozen until someone resized the window or typed.
-- **Root Cause**: On reconnect, the server called `TriggerResync()` before DTLS/SCTP handshaking finished. The full-screen redraw packet hit a closed DataChannel and vanished. The server thought it already refreshed the screen, leaving the client stuck.
-- **The Fix** (`main.go`):
-  ```go
-  dc.OnOpen(func() {
-      // Trigger full frame redrawing ONLY after SCTP channel is verified open!
-      sess.Server.TriggerResync()
-  })
-  ```
+### Bug 3: Reconnect Frozen Terminal (SCTP Open Race & Identical-Dimension Resize)
+- **Symptom**: Reconnecting to an existing session showed "Connected", but the screen remained frozen until someone resized the window or typed. Keystrokes were delivered and executed by the shell, but the client never rendered the output.
+- **Root Causes**:
+  1. **SCTP Open Race**: On reconnect, the server previously called `TriggerResync()` during the HTTP handler, before DTLS/SCTP handshaking finished. The full-screen redraw packet hit a closed DataChannel and vanished.
+  2. **Identical-Dimension Resize Guard**: On reconnect, the client re-sent its current dimensions (`moshSession.resize(term.cols, term.rows)`). The server previously guarded the base-framebuffer reset with `if cols != s.cols || rows != s.rows`. Because dimensions didn't change on reconnect, the guard skipped `ResetDiffBase()`, assuming the client still had the screen state. If the redraw packet was lost, all subsequent diffs were computed against a base the client lacked, so the client dropped them without ACK.
+  3. **Stale Unacknowledged Diff**: Once a diff was pending against a base the client dropped, neither side could make progress until a dimension change forced a resync.
+- **The Fix**:
+  - **Fire `TriggerResync` on `dc.OnOpen`** (`main.go`): Triggers full frame redrawing strictly after the SCTP channel is verified open.
+  - **Unconditional Redraw on Size Report** (`mosh-go/server.go:forceRedraw`): Every client size report (`ui.Width > 0 && ui.Height > 0`) unconditionally calls `forceRedraw()`, treating even identical-size reports as an explicit resync request.
+  - **Stale Diff Watchdog** (`mosh-go/server.go` + `mosh-go/transport.go`): If an outgoing diff stays unacknowledged for `> 3s` (`s.transport.Stale(3 * time.Second)`), the server automatically invokes `forceRedraw()` so the next tick repaints the entire screen from `oldNum = 0`.
 
 ---
 
@@ -282,16 +289,17 @@ mosh server exited: signal: killed
 An initial hypothesis blamed SIGHUP from a network switch. **Wrong**, and the log proves it:
 
 - `signal: killed` is **SIGKILL (9)**, not `signal: hangup` (SIGHUP = 1).
-- A network switch never touches the PTY: reconnect only swaps `sess.DataChannel` / `sess.PeerConn` (`main.go:381-389`); `s.ptmx` and the login process are untouched, because the gateway process — not the WebRTC socket — holds the PTY master.
+- A network switch never touches the PTY: reconnect only swaps `sess.DataChannel` / `sess.PeerConn` (`main.go:414-438`); `s.ptmx` and the login process are untouched, because the gateway process — not the WebRTC socket — holds the PTY master.
 - Nothing in the exec path can send SIGKILL: no `exec.CommandContext` and no cancelled context anywhere in `mosh-go`.
 
-There are exactly **three** `Process.Kill()` sites in the codebase:
+There are **four** `Process.Kill()` sites in the codebase:
 
 | Site | Logged? | Reachable in production? |
 |---|---|---|
 | `mosh-go/server.go` `Close()` | no | no (tests only) |
-| `mosh-go/server.go` `mainLoop` auth limit | no (now yes) | **yes — the culprit** |
-| `mosh-go/server.go` `mainLoopRW` auth limit | no (now yes) | yes |
+| `mosh-go/server.go` `Kill()` | no | **yes — via `endSession` and session reaper** |
+| `mosh-go/server.go` `mainLoop` auth limit | yes | **yes — the culprit** |
+| `mosh-go/server.go` `mainLoopRW` auth limit | yes | yes |
 
 ### The Actual Mechanism
 `countAuthFailures(data []byte)` scanned **all** raw PTY output for the literal `"Login incorrect"` and killed the shell process at 5 hits, regardless of authentication state.
