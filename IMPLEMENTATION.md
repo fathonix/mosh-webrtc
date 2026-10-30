@@ -1,6 +1,6 @@
 # Mosh WebRTC Implementation Spec & Architecture Document
 
-This document records the exact mechanics, protocol flows, data structures, bug fixes, edge-case solutions, and security architectures implemented in **`mosh-webrtc`** (`/Users/user/aldo/moonlight-web-stream/mosh-webrtc/`).
+This document records the exact mechanics, protocol flows, data structures, bug fixes, edge-case solutions, and security architectures implemented in **`mosh-webrtc`**.
 
 ---
 
