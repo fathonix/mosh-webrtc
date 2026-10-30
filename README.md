@@ -139,6 +139,13 @@ Covers the transport (fragmentation, OCB, SSP acks), state synchronization and r
 state detection, JWT middleware, rate limiting and session limits. The optional interop test
 against the C++ `mosh-server` is skipped when it is not installed.
 
-## License
+## Credits
 
-MIT (see the upstream `mosh-go` and `moonlight-web-stream` licenses for inherited code).
+The Mosh protocol implementation is [`mosh-go`](https://github.com/unixshells/mosh-go), vendored
+under `mosh-go/` and MIT licensed (Copyright (c) 2026 Unix Shells) — its client is what runs in the
+browser as WASM, and its server is what runs in the gateway. The wire format, AES-128-OCB3
+encryption, diffing and predictive echo all come from there; this project adds the WebRTC transport,
+session roaming, access control and the UI around it.
+
+Terminal rendering uses [xterm.js](https://xtermjs.org) with the
+[Spleen](https://github.com/fcambus/spleen) bitmap fonts.
