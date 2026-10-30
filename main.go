@@ -463,9 +463,9 @@ func main() {
 	mux.HandleFunc("/api/session/", handleSession)
 
 	if production() {
-		log.Println("[INFO] MODE=production: Cloudflare Access JWT required")
+		log.Println("[INFO] APP_ENV=production: Cloudflare Access JWT required")
 	} else {
-		log.Println("[INFO] MODE=development: authentication disabled")
+		log.Println("[INFO] APP_ENV=development: authentication disabled")
 	}
 
 	log.Printf("[INFO] Mosh WebRTC server listening on http://%s", addr)

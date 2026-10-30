@@ -22,7 +22,7 @@ import (
 // therefore authenticate every request. Anything else is development, where
 // Cloudflare is not in front and devtools talks to the port directly.
 func production() bool {
-	return strings.EqualFold(os.Getenv("MODE"), "production")
+	return strings.EqualFold(os.Getenv("APP_ENV"), "production")
 }
 
 // cfAccessValidator checks Cloudflare Access JWTs (and an optional static bearer
@@ -49,7 +49,7 @@ func newCFAccessValidator() *cfAccessValidator {
 	}
 }
 
-// withAuth wraps a handler with Cloudflare Access checks when MODE=production.
+// withAuth wraps a handler with Cloudflare Access checks when APP_ENV=production.
 // In development it is a no-op so devtools can hit the port directly.
 func withAuth(next http.Handler) http.Handler {
 	if !production() {
@@ -57,12 +57,12 @@ func withAuth(next http.Handler) http.Handler {
 	}
 	v := newCFAccessValidator()
 	if v.teamDomain == "" || v.aud == "" {
-		log.Fatal("[FATAL] MODE=production requires CF_TEAM_DOMAIN and CF_ACCESS_AUD")
+		log.Fatal("[FATAL] APP_ENV=production requires CF_TEAM_DOMAIN and CF_ACCESS_AUD")
 	}
 	return v.middleware(next)
 }
 
-// middleware rejects unauthenticated requests when MODE=production.
+// middleware rejects unauthenticated requests when APP_ENV=production.
 func (v *cfAccessValidator) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if v.staticTok != "" && v.checkStatic(r) {

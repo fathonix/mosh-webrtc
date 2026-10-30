@@ -16,8 +16,8 @@ import (
 )
 
 func TestCFAccessMiddlewareDev(t *testing.T) {
-	os.Setenv("MODE", "development")
-	defer os.Unsetenv("MODE")
+	os.Setenv("APP_ENV", "development")
+	defer os.Unsetenv("APP_ENV")
 
 	val := newCFAccessValidator()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -39,8 +39,8 @@ func TestCFAccessMiddlewareDev(t *testing.T) {
 }
 
 func TestCFAccessMiddlewareProd(t *testing.T) {
-	os.Setenv("MODE", "production")
-	defer os.Unsetenv("MODE")
+	os.Setenv("APP_ENV", "production")
+	defer os.Unsetenv("APP_ENV")
 
 	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
